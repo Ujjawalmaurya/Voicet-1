@@ -36,7 +36,6 @@ import string
 from scipy.io.wavfile import write
 import sys
 
-# sys.path.append('/home/shubhankar/Project/VAKYANSH_TTS')
 vakyansh_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'VAKYANSH_TTS'))
 sys.path.append(vakyansh_path)
 from tts_infer.tts import TextToMel, MelToWav
@@ -45,6 +44,20 @@ from tts_infer.num_to_word_on_sent import normalize_nums
 
 if hasattr(torch.serialization, 'add_safe_globals'):
     torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+
+# Mapping for Vakyansh TTS language codes
+VAKYANSH_LANG_MAP = {
+    'hindi': 'hi',
+    'kannada': 'kn',
+    'tamil': 'ta',
+    'telugu': 'te',
+    'odia': 'or',
+    'malayalam': 'ml',
+    'marathi': 'mr',
+    'gujarati': 'gu',
+    'bengali': 'bn',
+    'english': 'en'
+}
 
 # Global cache for TTS models to avoid reloading on every request
 tts_model_cache = {}
@@ -264,12 +277,16 @@ for code in codes_as_string:
     flores_codes[lang] = lang_code
 
 
-# --- Model Configuration ---
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+
 # Whisper Model (Transcription)
 # Options: 'tiny.en', 'base.en', 'small.en', 'medium.en'
 # 'base.en' is a good balance of speed and accuracy. 
 WHISPER_MODEL_NAME = 'base.en'
-asr_model = whisper.load_model(WHISPER_MODEL_NAME)
+print(f"Loading Whisper model {WHISPER_MODEL_NAME} on {device}...")
+asr_model = whisper.load_model(WHISPER_MODEL_NAME, device=device)
 
 # Transcription Options
 # Increased beam_size/best_of improves quality but needs more CPU.
@@ -278,20 +295,19 @@ transcribe_options = dict(
     best_of=5, 
     without_timestamps=False, 
     language='English', 
-    fp16=False
+    fp16=(device == "cuda")
 )
-
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
 
 # NLLB Model (Translation)
 # Options: 'facebook/nllb-200-distilled-600M' (Fast), 'facebook/nllb-200-distilled-1.3B' (Accurate)
 TASK = "translation"
 CKPT = "facebook/nllb-200-distilled-1.3B"
 
-print(f"Loading {CKPT}...")
-model = AutoModelForSeq2SeqLM.from_pretrained(CKPT)
+print(f"Loading {CKPT} on {device}...")
+model = AutoModelForSeq2SeqLM.from_pretrained(
+    CKPT, 
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32
+).to(device)
 tokenizer = AutoTokenizer.from_pretrained(CKPT)
 
 
@@ -429,71 +445,46 @@ def convert_floats(row):
 import logging
 logger = logging.getLogger(__name__)
 
-def translate(df, src_lang="eng_Latn", tgt_lang="hin_Deva", max_batch_chars=400):
+def translate(df, src_lang="eng_Latn", tgt_lang="hin_Deva", batch_size=16):
     """
-    Translates segments in the dataframe.
-    Uses context batching: groups multiple short segments into a single chunk
-    to provide better context (gender, tense, etc.) for the NLLB model.
+    Translates segments in the dataframe using batched inference for high performance.
     """
-    translation_pipeline = pipeline(TASK,
-                                    model=model,
-                                    tokenizer=tokenizer,
-                                    src_lang=src_lang,
-                                    tgt_lang=tgt_lang,
-                                    max_length=400,
-                                    device=device)
+    if df.empty:
+        return df
 
-    # REVISED ROBUST APPROACH: Prepend previous segment as context (prefixing)
-    # This is a common trick for NMT models.
+    # Prepare texts
+    texts = df['TEXT'].tolist()
     
-    output_column = []
-    previous_context = ""
+    # Transformers pipeline 'device' expects -1 for CPU or an integer (0, 1, ...) for GPU
+    pipeline_device = 0 if device == "cuda" else -1
     
-    for index, row in df.iterrows():
-        current_text = row['TEXT'].strip()
-        if not current_text:
-            output_column.append("")
-            continue
-            
-        # Prepend previous segment if available for context
-        # We don't want to translate the whole thing, just use it for context.
-        # NLLB doesn't have a "context" parameter, so we just give it more text.
+    try:
+        translation_pipeline = pipeline(TASK,
+                                        model=model,
+                                        tokenizer=tokenizer,
+                                        src_lang=src_lang,
+                                        tgt_lang=tgt_lang,
+                                        max_length=400,
+                                        device=pipeline_device)
+
+        logger.info(f"Translating {len(texts)} segments with batch_size={batch_size} on {device}...")
+        results = translation_pipeline(texts, batch_size=batch_size)
+        df['TRANSLATION'] = [res['translation_text'] for res in results]
+        logger.info("Translation complete.")
         
-        try:
-            if previous_context:
-                full_input = f"{previous_context} {current_text}"
-                result = translation_pipeline(full_input)
-                if result and len(result) > 0:
-                    translated_full = result[0]['translation_text']
-                    
-                    # Try to extract only the last part (the current segment's translation)
-                    # This is tricky without knowing the alignment. 
-                    
-                    output_value = translated_full # Fallback
-                    # If the translation has a clear sentence break, take the last part
-                    # (Very rough heuristic for Hindi/English)
-                    if '।' in translated_full:
-                        output_value = translated_full.split('।')[-1].strip()
-                    elif '.' in translated_full:
-                         output_value = translated_full.split('.')[-1].strip()
-                else:
-                    logger.warning(f"Translation returned empty result for: {full_input}")
-                    output_value = current_text
-            else:
-                result = translation_pipeline(current_text)
-                if result and len(result) > 0:
-                    output_value = result[0]['translation_text']
-                else:
-                    logger.warning(f"Translation returned empty result for: {current_text}")
-                    output_value = current_text
-        except Exception as e:
-            logger.error(f"Translation error at index {index}: {e}")
-            output_value = current_text # Fallback to original text on error
-            
-        output_column.append(output_value)
-        previous_context = current_text
-        
-    df['TRANSLATION'] = output_column
+    except Exception as e:
+        logger.error(f"Translation batch failed: {e}. Falling back to sequential.")
+        # Fallback logic to avoid total failure
+        output_column = []
+        for text in texts:
+            try:
+                # Use the pipeline sequentially on error
+                res = translation_pipeline(text)
+                output_column.append(res[0]['translation_text'] if res else text)
+            except Exception:
+                output_column.append(text)
+        df['TRANSLATION'] = output_column
+
     return df
 
 def translit(text, lang):
@@ -508,8 +499,6 @@ def run_tts(text, lang='hi',count=0):
 #    language_voice= language_voice.lower()
 #    gender_voice = gender_voice.lower()
 
-#    glow_model_dir=f'/home/shubhankar/TestProjects/WebApp/VAKYANSH_TTS/tts_infer/translit_models/{language_voice}/{gender_voice}/glow_ckp'
-#    hifi_model_dir=f'/home/shubhankar/TestProjects/WebApp/VAKYANSH_TTS/tts_infer/translit_models/{language_voice}/{gender_voice}/hifi_ckp'
 
 #    print('#'*200)
 #    print(language_voice)
@@ -555,8 +544,6 @@ def translate_video(video_path,language_voice,gender_voice,output_path):
     language_voice= language_voice.lower()
     gender_voice = gender_voice.lower()
 
-    # glow_model_dir=f'/home/shubhankar/Project/VAKYANSH_TTS/tts_infer/translit_models/{language_voice}/{gender_voice}/glow_ckp'
-    # hifi_model_dir=f'/home/shubhankar/Project/VAKYANSH_TTS/tts_infer/translit_models/{language_voice}/{gender_voice}/hifi_ckp'
     
     vakyansh_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'VAKYANSH_TTS'))
     glow_model_dir = os.path.join(vakyansh_path, 'tts_infer', 'translit_models', language_voice, gender_voice, 'glow_ckp')
@@ -592,12 +579,15 @@ def translate_video(video_path,language_voice,gender_voice,output_path):
 
 
     try:
+        # Get the Vakyansh language code (e.g., 'hi', 'or')
+        vakyansh_lang = VAKYANSH_LANG_MAP.get(language_voice, 'hi')
+        
         for index, row in df2.iterrows():
         # get the translation and ID
             text = row['TRANSLATION']
             id = index
         # generate audio file using the TTS function and store the path in the "path" column
-            path = run_tts(text, count=id )
+            path = run_tts(text, lang=vakyansh_lang, count=id)
             df.at[index, 'AUDIO'] = path
     except AssertionError:
         print('Oooooooooooooooooooooooooooooooooooooooooooops')
